@@ -1,4 +1,11 @@
-#include "../include/libusb.h"
+#include "libusb.h"
+#include "libavcodec/avcodec.h"
+#include "libavformat/avformat.h"
+#include "libavutil/error.h"
+#include "libavcodec/avcodec.h"
+#include "libavutil/imgutils.h"
+#include "libavutil/opt.h"
+
 #include <stdio.h>
 #include <pthread.h>
 #include <malloc.h>
@@ -7,6 +14,7 @@
 
 
 #define Debug(_fmt, _args...)      {printf("\033[40;35m###%s line %d ",__func__, __LINE__);printf(_fmt, ##_args); printf("\033[0m");}
+#define IOBufferMaxSize 32768
 
 int exit_flag = 0;
 
@@ -32,11 +40,17 @@ typedef struct usb_device{
     int exit_flag;                      /*退出标志位*/
     uint16_t max_input_size;
     uint16_t max_output_size;
+    uint8_t *io_buffer;
+    unsigned int len;
 
     usb_transfer *usb_transfer;
 
     pthread_t event_thread_id;
     pthread_mutex_t mutex;
+
+    pthread_t encodec_thread;
+    pthread_cond_t read_cond;
+    pthread_mutex_t read_mutex;
     
     libusb_context *cxt;
     libusb_device *dev;
@@ -420,6 +434,7 @@ void *usb_transfer_thread(void *arg)
     usb_device *dev = (usb_device *)arg;
     uint8_t Buffer[dev->max_input_size];
 
+    dev->io_buffer = Buffer;
     FILE *f = fopen("frame.h264","a+");
     if(NULL == f)
         return NULL;
@@ -442,7 +457,7 @@ void *usb_transfer_thread(void *arg)
         ret = libusb_submit_transfer(dev->usb_transfer->xfr);
 
         if(ret!= LIBUSB_SUCCESS){
-            Debug("%s  %dusb submit transfer %s\n",__func__,__LINE__,libusb_error_name(ret));
+            Debug("usb submit transfer %s\n",libusb_error_name(ret));
             dev->usb_transfer->stop_transfer = 1;
             dev->usb_transfer->usbActive = 0;
             pthread_mutex_unlock(&dev->usb_transfer->mutex);
@@ -514,6 +529,8 @@ void *usb_transfer_thread(void *arg)
                     uchcomplete = 0;
                 }
             }
+            dev->len = uilen;
+            pthread_cond_signal(&dev->read_cond);
             break;
         case LIBUSB_TRANSFER_CANCELLED:
             fclose(f);
@@ -671,6 +688,196 @@ void *usb_event_monitor_process(void *arg)
     
 }
 
+int fill_iobuffer(void *opaque,uint8_t *buf, int bufsize)
+{
+    int ret;
+    usb_device *dev = (usb_device *)opaque;
+    Debug("wait.....\n");
+    pthread_cond_wait(&dev->read_cond,&dev->read_mutex);
+    Debug("get a frame\n");
+    if(dev->io_buffer!=NULL && !dev->exit_flag){
+        memcpy(buf,dev->io_buffer,dev->len);
+        return dev->len;
+    }else{
+        return -1;
+    }
+}
+
+
+
+void *encode_thread(void *arg)
+{
+    usb_device *dev = (usb_device *)arg;
+    int frist_frame = 1;
+    int ret;
+
+    AVFormatContext *p = avformat_alloc_context();
+    if(NULL == p){
+        Debug("%d\n",AVERROR(ENOMEM));
+        return NULL;
+    }
+
+    uint8_t *iobuffer = (uint8_t *)malloc(IOBufferMaxSize);
+    if(NULL == iobuffer)
+        return NULL;
+
+    AVIOContext *avio = avio_alloc_context(iobuffer,IOBufferMaxSize,0,dev,fill_iobuffer,NULL,NULL);
+    p->pb = avio;
+
+    ret = avformat_open_input(&p,NULL,NULL,NULL);
+    if(ret!= 0){
+        Debug("%s\n",av_err2str(ret));
+        goto ERR;
+    }
+
+    AVCodecContext *de_codec = avcodec_alloc_context3(NULL);
+    AVCodecContext *en_codec = avcodec_alloc_context3(NULL);
+
+    ret = avcodec_parameters_to_context(de_codec,p->streams[0]->codecpar);
+    if(ret < 0){
+        Debug("%s\n",av_err2str(ret));
+        goto ERR;
+    }
+
+    AVCodec *de_code = (AVCodec *)avcodec_find_decoder(de_codec->codec_id);
+    if((ret = avcodec_open2(de_codec,de_code,NULL))!= 0){
+        Debug("%s\n",av_err2str(ret));
+        goto ERR;
+    }
+
+    AVFormatContext *f = NULL;
+    ret = avformat_alloc_output_context2(&f,NULL,NULL,"./frame.mp4");
+    if(ret < 0){
+        Debug("%s\n",av_err2str(ret));
+        goto ERR;
+    }
+
+    AVStream *st = avformat_new_stream(f,NULL);
+
+    st->time_base = p->streams[0]->time_base;
+    AVPacket *out_pack = av_packet_alloc();
+    AVPacket *in_pack = av_packet_alloc();
+    AVFrame *out_frame = av_frame_alloc();
+    int read_end = 0;
+    while (1)
+    {
+        if(!dev->exit_flag || read_end)
+            break;
+        
+        ret = av_read_frame(p,in_pack);
+        if(ret == 0){
+            if(in_pack->stream_index == 1){
+                av_packet_unref(in_pack);
+                continue;
+            }
+
+            ret = avcodec_send_packet(en_codec,in_pack);
+
+            if(ret!= 0){
+                Debug("%s\n",av_err2str(ret));
+            }
+            av_packet_unref(in_pack);
+        }else if(ret < 0){
+            avcodec_send_packet(de_codec,NULL);
+        }else{
+            Debug("%s\n",av_err2str(ret));
+            continue;
+        }
+
+        for(;;){
+
+            ret = avcodec_receive_frame(de_codec,out_frame);
+            if(AVERROR_EOF == ret){
+                ret = avcodec_send_packet(en_codec,NULL);
+                read_end = 1;
+                break;
+            }else if (ret == 0){
+                if(NULL == en_codec){
+                    AVCodec *en_avcode = (AVCodec*)avcodec_find_encoder(AV_CODEC_ID_H264);
+                    en_codec = avcodec_alloc_context3(en_avcode);
+
+                    en_codec->codec_type = AVMEDIA_TYPE_VIDEO;
+                    en_codec->bit_rate = 4000000;
+                    en_codec->framerate = de_codec->framerate;
+                    en_codec->gop_size = 50;
+  //                  en_codec->max_b_frames = 5;
+                    en_codec->profile = FF_PROFILE_H264_HIGH_444;
+
+                    en_codec->time_base = p->streams[0]->time_base;
+                    en_codec->width = p->streams[0]->codecpar->width;
+                    en_codec->height = p->streams[0]->codecpar->height;
+                    en_codec->sample_aspect_ratio = out_frame->sample_aspect_ratio;
+                    
+                    en_codec->pix_fmt = out_frame->format;
+
+                    en_codec->color_primaries = out_frame->color_primaries;
+                    en_codec->color_range = out_frame->color_range;
+                    en_codec->color_trc = out_frame->color_trc;
+                    en_codec->colorspace = out_frame->colorspace;
+                    en_codec->chroma_sample_location = out_frame->chroma_location;
+                    
+                    en_codec->field_order = AV_FIELD_UNKNOWN;
+
+                    ret = avcodec_parameters_from_context(st->codecpar,en_codec);
+                    if(0 > ret)
+                    {
+                        Debug("%s\n",av_err2str(ret));
+                        goto ERR;
+                    }
+                    /*打开编码器*/
+                    if(0 > (ret = avcodec_open2(en_codec,en_avcode,NULL)))
+                    {
+                       Debug("%s\n",av_err2str(ret));
+                        goto ERR;
+                    }
+                  //  av_dict_free(&options);
+                    /*正式打开输出文件*/
+                    if(0 >(ret = avio_open2(&f->pb,"./fream.mp4",AVIO_FLAG_WRITE,&f->interrupt_callback,NULL)))
+                    {
+                        Debug("%s\n",av_err2str(ret));
+                        goto ERR;
+                    }
+                    /*写入数据头到输出文件*/
+                    if(0 > (ret = avformat_write_header(f,NULL)))
+                    {
+                        Debug("%s\n",av_err2str(ret));
+                        goto ERR;
+                    }
+
+                    out_pack->stream_index = st->index;
+                    out_pack->pts = av_rescale_q_rnd(out_pack->pts,p->streams[0]->time_base,st->time_base,AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
+                    out_pack->dts = av_rescale_q_rnd(out_pack->dts,p->streams[0]->time_base,st->time_base,AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
+                    out_pack->duration = av_rescale_q_rnd(out_pack->duration,p->streams[0]->time_base,st->time_base,AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
+                    /*把数据包写入输出文件*/
+                    ret = av_interleaved_write_frame(f,out_pack);
+                    if(0!=ret)
+                    {
+                        Debug("%s\n",av_err2str(ret));
+                        goto ERR;
+                    }
+                    av_packet_unref(out_pack);
+                }
+
+            }else if(AVERROR(EAGAIN) == ret){
+                break;
+            }else{
+                Debug("%s\n",av_err2str(ret));
+            }
+            
+        }
+    }
+    
+
+    ERR:
+        avio_context_free(&avio);
+        avformat_free_context(p);
+        free(iobuffer);
+
+        avcodec_free_context(&de_codec);
+        avcodec_free_context(&en_codec);
+        return NULL;
+}
+
 /**
  * @brief 
  * usb库初始化,注册热插拔回调,创建热插拔事件处理线程
@@ -724,6 +931,10 @@ int usb_init(usb_device *dev)
     }
     /*创建事件处理线程*/
     ret = pthread_create(&dev->event_thread_id,NULL,usb_event_monitor_process,dev);
+
+    pthread_cond_init(&dev->read_cond,NULL);
+    pthread_mutex_init(&dev->read_mutex,NULL);
+    ret = pthread_create(&dev->event_thread_id,NULL,encode_thread,dev);
 
     return 1;
 
